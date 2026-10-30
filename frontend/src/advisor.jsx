@@ -3,22 +3,35 @@ import { createRoot } from 'react-dom/client';
 import {
   ShieldCheck, Mail, LogOut, Users, Eye, LockKeyhole, LoaderCircle,
   CircleAlert, Check, X, ArrowDownLeft, ArrowUpRight,
-  ReceiptText, Leaf, KeyRound, UserRound,
+  ReceiptText, Leaf, KeyRound, UserRound, RefreshCw,
 } from 'lucide-react';
 import './style.css';
 
 const API = (import.meta.env.VITE_API_URL || 'http://127.0.0.1:8000').replace(/\/$/, '');
 const money = (v) => new Intl.NumberFormat('en-IN', { style:'currency', currency:'INR', maximumFractionDigits:0 }).format(Number(v||0));
 const moneyExact = (v) => new Intl.NumberFormat('en-IN', { style:'currency', currency:'INR', maximumFractionDigits:2 }).format(Number(v||0));
-const dateText = (s) => s ? new Date(`${s}T12:00:00`).toLocaleDateString('en-IN', { day:'numeric', month:'short', year:'numeric' }) : '\u2014';
+const dateText = (s) => s ? new Date(`${s}T12:00:00`).toLocaleDateString('en-IN', { day:'numeric', month:'short', year:'numeric' }) : '—';
 
 async function api(path, { method='GET', token, body } = {}) {
   const headers = {};
   if (token) headers.Authorization = `Bearer ${token}`;
   if (body !== undefined) headers['Content-Type'] = 'application/json';
-  const res = await fetch(`${API}${path}`, { method, headers, body: body !== undefined ? JSON.stringify(body) : undefined });
-  let data; try { data = await res.json(); } catch { data = { detail: 'Unexpected response.' }; }
-  if (!res.ok) throw new Error(data.detail || `Request failed (${res.status})`);
+  const res = await fetch(`${API}${path}`, {
+    method,
+    headers,
+    cache: 'no-store',
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  let data;
+  try { data = await res.json(); } catch { data = { detail: 'Unexpected response.' }; }
+  if (!res.ok) {
+    let msg;
+    if (typeof data.detail === 'string') msg = data.detail;
+    else if (Array.isArray(data.detail)) msg = data.detail.map(d => ((Array.isArray(d.loc) ? d.loc.join('.') : '') + ': ' + (d.msg || JSON.stringify(d)))).join('; ');
+    else if (data.detail) msg = JSON.stringify(data.detail);
+    else msg = `Request failed (${res.status})`;
+    throw new Error(msg);
+  }
   return data;
 }
 
@@ -54,12 +67,19 @@ function AdvisorApp() {
     } finally { setLoading(false); }
   }
 
-  useEffect(() => { if (token) refresh(token); }, [token]);
-
   function logout() {
     localStorage.removeItem('finsight_token'); localStorage.removeItem('finsight_user');
     setToken(''); setUser(null); setInvitations([]); setClients([]); setSummary(null); setSelectedEmail('');
   }
+
+  useEffect(() => { if (token) refresh(token); }, [token]);
+
+  useEffect(() => {
+    if (!selectedEmail || !token) return;
+    const onFocus = () => { refreshSummary(false); };
+    window.addEventListener('focus', onFocus);
+    return () => window.removeEventListener('focus', onFocus);
+  }, [selectedEmail, token]);
 
   async function submitAuth(e) {
     e.preventDefault(); setAuthError('');
@@ -86,6 +106,29 @@ function AdvisorApp() {
       setSummary(s);
     } catch (e) { notify(e.message, 'error'); setSelectedEmail(''); } finally { setBusy(false); }
   }
+  async function refreshSummary(showToast = false) {
+    if (!selectedEmail) return;
+    try {
+      setBusy(true);
+      const s = await api(`/api/advisor?client_email=${encodeURIComponent(selectedEmail)}`, { token });
+      setSummary(s);
+      if (showToast) notify('Summary updated');
+    } catch (e) {
+      notify(e.message, 'error');
+    } finally {
+      setBusy(false);
+    }
+  }
+  async function refreshAll() {
+    try {
+      setBusy(true);
+      await refresh();
+      if (selectedEmail) await refreshSummary(false);
+      notify('Portal refreshed');
+    } catch (e) {
+      notify(e.message, 'error');
+    } finally { setBusy(false); }
+  }
 
   if (!token) return <PortalAuth mode={authMode} setMode={(m) => { setAuthMode(m); setAuthError(''); }} form={authForm} setForm={setAuthForm} submit={submitAuth} error={authError} />;
 
@@ -94,6 +137,7 @@ function AdvisorApp() {
       <header className="portal-topbar">
         <div className="portal-brand"><div className="brand-mark"><Leaf size={22}/></div><div><div className="portal-brand-name">finsight<span>.</span></div><div className="portal-brand-caption">ADVISOR PORTAL</div></div></div>
         <div className="portal-user">
+          <button className="icon-btn" onClick={refreshAll} disabled={busy} title="Refresh"><RefreshCw size={17} className={busy ? 'spin' : ''}/></button>
           <div className="portal-avatar">{(user?.name || 'A').slice(0,1).toUpperCase()}</div>
           <div className="portal-user-copy"><strong>{user?.name || 'Advisor'}</strong><span>{user?.email || ''}</span></div>
           <button className="icon-btn" onClick={logout} title="Sign out"><LogOut size={17}/></button>
@@ -162,7 +206,12 @@ function AdvisorApp() {
                       <h2>{summary.client.name}</h2>
                       <p>{summary.client.email}</p>
                     </div>
-                    <span className="status-tag good"><LockKeyhole size={12}/> Read only</span>
+                    <div style={{ display: 'flex', gap: 8, alignItems: 'center' }}>
+                      <button className="btn btn-quiet btn-small" onClick={() => refreshSummary(true)} disabled={busy} title="Refresh summary">
+                        <RefreshCw size={14} className={busy ? 'spin' : ''}/> Refresh
+                      </button>
+                      <span className="status-tag good"><LockKeyhole size={12}/> Read only</span>
+                    </div>
                   </div>
                   <div className="portal-summary-stats">
                     <div><span>Net cash flow</span><strong>{money(summary.summary.balance)}</strong></div>
@@ -177,7 +226,7 @@ function AdvisorApp() {
                           <div className="portal-tx" key={t.id}>
                             <div className={`portal-tx-icon ${t.kind}`}>{t.kind === 'income' ? <ArrowDownLeft size={16}/> : <ArrowUpRight size={16}/>}</div>
                             <div className="portal-tx-body"><strong>{t.note || t.category}</strong><span>{t.category} · {dateText(t.trans_date)}</span></div>
-                            <span className={`portal-tx-amount ${t.kind}`}>{t.kind === 'income' ? '+' : '\u2212'}{moneyExact(t.amount)}</span>
+                            <span className={`portal-tx-amount ${t.kind}`}>{t.kind === 'income' ? '+' : '−'}{moneyExact(t.amount)}</span>
                           </div>
                         ))}
                       </div>
@@ -193,7 +242,7 @@ function AdvisorApp() {
 
       <footer className="portal-footer">
         <span>FinSight Advisor Portal</span>
-        <span>Read-only \u00b7 No editing \u00b7 Revocable by client</span>
+        <span>Read-only · No editing · Revocable by client</span>
       </footer>
 
       {toast && (
@@ -221,7 +270,7 @@ function PortalAuth({ mode, setMode, form, setForm, submit, error }) {
         <div className="portal-auth-body">
           <span className="eyebrow"><ShieldCheck size={13}/> READ-ONLY FINANCIAL ADVISOR ACCESS</span>
           <h1>{mode === 'login' ? 'Welcome back, advisor.' : 'Create your advisor account.'}</h1>
-          <p>Sign in to review client summaries shared with your email. You can only view data \u2014 never edit it.</p>
+          <p>Sign in to review client summaries shared with your email. You can only view data — never edit it.</p>
           <form className="auth-form" onSubmit={submit}>
             {mode === 'register' && <label>Your name<div className="field-icon"><UserRound size={17}/><input required minLength={2} maxLength={100} autoComplete="name" placeholder="Your full name" value={form.name} onChange={e => setForm({ ...form, name: e.target.value })}/></div></label>}
             <label>Email address<div className="field-icon"><Mail size={17}/><input required type="email" autoComplete="email" placeholder="advisor@example.com" value={form.email} onChange={e => setForm({ ...form, email: e.target.value })}/></div></label>

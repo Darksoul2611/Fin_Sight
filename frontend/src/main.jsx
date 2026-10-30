@@ -11,7 +11,26 @@ const dateText=(s)=>s?new Date(`${s}T12:00:00`).toLocaleDateString('en-IN',{day:
 const todayISO=()=>new Date().toISOString().slice(0,10);
 const nav=[{label:'Workspace',items:[['Overview',LayoutDashboard],['Transactions',ArrowLeftRight],['Budgets',WalletCards],['Goals',Target]]},{label:'Insights',items:[['Analytics',ChartNoAxesCombined],['Forecasts',TrendingUp],['Alerts',Bell]]},{label:'Management',items:[['Advisor access',Users],['Settings',Settings]]}];
 const categoryOptions=['Food','Transport','Shopping','Bills & utilities','Health','Entertainment','Education','Housing','Salary','Freelance','Investment returns','Other'];
-async function api(path,{method='GET',token,body,form,headers={}}={}){const h={...headers};if(token)h.Authorization=`Bearer ${token}`;if(body!==undefined)h['Content-Type']='application/json';const res=await fetch(`${API}${path}`,{method,headers:h,body:form|| (body!==undefined?JSON.stringify(body):undefined)});let data;try{data=await res.json()}catch{data={detail:'Unexpected response from the server.'}}if(!res.ok)throw new Error(data.detail||`Request failed (${res.status})`);return data}
+async function api(path,{method='GET',token,body,form,headers={}}={}){
+  const h={...headers};
+  if(token)h.Authorization=`Bearer ${token}`;
+  if(body!==undefined)h['Content-Type']='application/json';
+  const res=await fetch(`${API}${path}`,{method,headers:h,body:form|| (body!==undefined?JSON.stringify(body):undefined)});
+  let data;
+  try{data=await res.json()}catch{data={detail:'Unexpected response from the server.'}}
+  if(!res.ok){
+    let msg;
+    if(typeof data.detail === 'string') msg = data.detail;
+    else if(Array.isArray(data.detail)) msg = data.detail.map(d => {
+      const loc = Array.isArray(d.loc) ? d.loc.join('.') : '';
+      return (loc ? loc + ': ' : '') + (d.msg || JSON.stringify(d));
+    }).join('; ');
+    else if(data.detail) msg = JSON.stringify(data.detail);
+    else msg = `Request failed (${res.status})`;
+    throw new Error(msg);
+  }
+  return data;
+}
 function App(){
  const [token,setToken]=useState(()=>localStorage.getItem('finsight_token')||'');const [user,setUser]=useState(()=>{try{return JSON.parse(localStorage.getItem('finsight_user')||'null')}catch{return null}});const [page,setPage]=useState('Overview');const [mobileMenu,setMobileMenu]=useState(false);const [dark,setDark]=useState(false);const [toast,setToast]=useState(null);const [loading,setLoading]=useState(false);const [data,setData]=useState(null);const [transactions,setTransactions]=useState([]);const [budgets,setBudgets]=useState([]);const [goals,setGoals]=useState([]);const [alerts,setAlerts]=useState([]);const [links,setLinks]=useState([]);const [search,setSearch]=useState('');const [txFilter,setTxFilter]=useState('all');const [modal,setModal]=useState('');const [editing,setEditing]=useState(null);const [authMode,setAuthMode]=useState('login');const [authForm,setAuthForm]=useState({name:'',email:'',password:''});const [authError,setAuthError]=useState('');const [txForm,setTxForm]=useState({kind:'expense',amount:'',category:'',note:'',trans_date:todayISO()});const [budgetForm,setBudgetForm]=useState({category:'Food',limit_amount:'',period:'monthly'});const [goalForm,setGoalForm]=useState({name:'',target_amount:'',saved_amount:'0',target_date:''});const [advisorEmail,setAdvisorEmail]=useState('');const [progressForm,setProgressForm]=useState({});const [period,setPeriod]=useState('6 months');const [showPassword,setShowPassword]=useState(false);const [busyAction,setBusyAction]=useState(false);const [advisorClients,setAdvisorClients]=useState([]);const [advisorSelection,setAdvisorSelection]=useState('');const [advisorSummary,setAdvisorSummary]=useState(null);const [advisorInvitations,setAdvisorInvitations]=useState([]);
  const notify=(message,type='success')=>{setToast({message,type});setTimeout(()=>setToast(null),3400)};
@@ -20,7 +39,7 @@ function App(){
  useEffect(()=>{if(token)refreshAll(token)},[token]);useEffect(()=>{document.documentElement.dataset.theme=dark?'dark':'light'},[dark]);
  const runAction=async fn=>{try{setBusyAction(true);await fn();}catch(e){notify(e.message,'error')}finally{setBusyAction(false)}};
  async function submitAuth(e){e.preventDefault();setAuthError('');try{const res=await api(`/api/auth/${authMode==='login'?'login':'register'}`,{method:'POST',body:authForm});localStorage.setItem('finsight_token',res.token);localStorage.setItem('finsight_user',JSON.stringify(res.user));setUser(res.user);setToken(res.token);notify(authMode==='login'?'Welcome back!':'Your FinSight account is ready.')}catch(e){setAuthError(e.message)}}
- function openTransaction(tx=null){setEditing(tx);setTxForm(tx?{kind:tx.kind,amount:String(tx.amount),category:tx.category,note:tx.note||'',trans_date:tx.trans_date}:{kind:'expense',amount:'',category:'',note:'',trans_date:todayISO()});setModal('transaction')}
+ function openTransaction(tx=null){const safeTx=(tx&&typeof tx==='object'&&typeof tx.id==='number')?tx:null;setEditing(safeTx);setTxForm(safeTx?{kind:safeTx.kind,amount:String(safeTx.amount),category:safeTx.category||'',note:safeTx.note||'',trans_date:safeTx.trans_date}:{kind:'expense',amount:'',category:'',note:'',trans_date:todayISO()});setModal('transaction')}
  async function saveTransaction(e){e.preventDefault();await runAction(async()=>{const body={...txForm,amount:Number(txForm.amount)};if(editing)await api(`/api/transactions/${editing.id}`,{method:'PUT',token,body});else await api('/api/transactions',{method:'POST',token,body});setModal('');await refreshAll();notify(editing?'Transaction updated':'Transaction saved successfully')})}
  async function deleteTransaction(tx){if(!confirm(`Delete this ${tx.kind} of ${moneyExact(tx.amount)}?`))return;await runAction(async()=>{await api(`/api/transactions/${tx.id}`,{method:'DELETE',token});await refreshAll();notify('Transaction deleted')})}
  async function saveBudget(e){e.preventDefault();await runAction(async()=>{await api('/api/budgets',{method:'POST',token,body:{...budgetForm,limit_amount:Number(budgetForm.limit_amount)}});setModal('');await refreshAll();notify('Budget saved')})}
@@ -39,7 +58,7 @@ async function declineInvite(id){await runAction(async()=>{await api(`/api/advis
  const displayTx=useMemo(()=>transactions.filter(t=>(txFilter==='all'||t.kind===txFilter)&&(!search||`${t.category} ${t.note}`.toLowerCase().includes(search.toLowerCase()))),[transactions,txFilter,search]);
  const greetingName=(user?.name||'there').trim().split(/\s+/)[0];
  if(!token)return <AuthScreen mode={authMode} setMode={m=>{setAuthMode(m);setAuthError('')}} form={authForm} setForm={setAuthForm} submit={submitAuth} error={authError} showPassword={showPassword} setShowPassword={setShowPassword}/>;
- const openModal=(name)=>{setModal(name);if(name==='budget')setBudgetForm({category:'Food',limit_amount:'',period:'monthly'});if(name==='goal')setGoalForm({name:'',target_amount:'',saved_amount:'0',target_date:''})};
+ const openModal=(name)=>{if(typeof name!=='string')name=null;setModal(name);if(name==='budget')setBudgetForm({category:'Food',limit_amount:'',period:'monthly'});if(name==='goal')setGoalForm({name:'',target_amount:'',saved_amount:'0',target_date:''})};
  return <div className="app-shell">
    <aside className={`sidebar ${mobileMenu?'sidebar-open':''}`}>
      <div className="brand"><div className="brand-mark"><Leaf size={23} strokeWidth={2.2}/></div><div><div className="brand-name">finsight<span>.</span></div><div className="brand-caption">PERSONAL FINANCE</div></div><button className="icon-btn sidebar-close" onClick={()=>setMobileMenu(false)}><X size={18}/></button></div>
