@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: finsight-api
+    runtime: docker
+    dockerfilePath: ./backend/Dockerfile
+    healthCheckPath: /api/health
+    envVars:
+      - key: SECRET_KEY
+        generateValue: true
+      - key: DATABASE_URL
+        value: sqlite:///./finsight.db
+      - key: CORS_ORIGINS
+        value: https://YOUR-FRONTEND-DOMAIN.example
