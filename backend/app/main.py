@@ -7,7 +7,7 @@ from typing import Literal
 from fastapi import FastAPI, Depends, HTTPException, UploadFile, File, Header
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, EmailStr, Field
-from sqlalchemy import create_engine, String, Integer, Date, DateTime, Numeric, ForeignKey, Boolean, Text, select, func, event
+from sqlalchemy import create_engine, String, Integer, Date, DateTime, Numeric, ForeignKey, Boolean, Text, select, func, event, inspect, text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker, Session, relationship
 from argon2 import PasswordHasher
 from argon2.exceptions import VerifyMismatchError, InvalidHashError
@@ -75,9 +75,37 @@ class AdvisorLink(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"), index=True)
     advisor_email: Mapped[str] = mapped_column(String(255), index=True)
+    advisor_user_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="SET NULL"), nullable=True, index=True)
+    status: Mapped[str] = mapped_column(String(20), default="pending", index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=datetime.utcnow)
+    accepted_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
 
 Base.metadata.create_all(bind=engine)
+
+def _migrate_advisor_links():
+    insp = inspect(engine)
+    if "advisor_links" not in insp.get_table_names():
+        return
+    cols = {c["name"] for c in insp.get_columns("advisor_links")}
+    with engine.begin() as conn:
+        if "advisor_user_id" not in cols:
+            conn.execute(text("ALTER TABLE advisor_links ADD COLUMN advisor_user_id INTEGER"))
+        if "status" not in cols:
+            conn.execute(text("ALTER TABLE advisor_links ADD COLUMN status VARCHAR(20) DEFAULT 'active'"))
+            conn.execute(text("UPDATE advisor_links SET status='active' WHERE status IS NULL OR status=''"))
+        if "accepted_at" not in cols:
+            conn.execute(text("ALTER TABLE advisor_links ADD COLUMN accepted_at DATETIME"))
+        if "revoked_at" not in cols:
+            conn.execute(text("ALTER TABLE advisor_links ADD COLUMN revoked_at DATETIME"))
+        conn.execute(text(
+            "UPDATE advisor_links SET advisor_user_id = "
+            "(SELECT users.id FROM users WHERE LOWER(users.email) = LOWER(advisor_links.advisor_email)) "
+            "WHERE advisor_user_id IS NULL"
+        ))
+
+_migrate_advisor_links()
+
 app = FastAPI(title=APP_NAME, version="1.0.0", description="Personal finance tracking, analytics, and goal management for FinSight.")
 origins = [x.strip() for x in os.getenv("CORS_ORIGINS", "http://localhost:5173,http://127.0.0.1:5173").split(",") if x.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=origins, allow_credentials=True, allow_methods=["*"], allow_headers=["*"])
@@ -102,7 +130,6 @@ class BudgetIn(BaseModel): category: str = Field(min_length=1, max_length=60); l
 class GoalIn(BaseModel): name: str = Field(min_length=1, max_length=120); target_amount: Decimal = Field(gt=0, max_digits=12, decimal_places=2); saved_amount: Decimal = Field(default=Decimal("0"), ge=0, max_digits=12, decimal_places=2); target_date: date
 class GoalProgressIn(BaseModel): saved_amount: Decimal = Field(ge=0, max_digits=12, decimal_places=2)
 class AdvisorIn(BaseModel): email: EmailStr
-class AdvisorClientIn(BaseModel): client_email: EmailStr
 
 CATEGORIES = {
     "Food": ["restaurant", "cafe", "coffee", "food", "grocery", "groceries", "swiggy", "zomato", "lunch", "dinner", "snack"],
@@ -122,9 +149,9 @@ def suggest_category(note: str, kind: str, given: str | None) -> str:
     if given and given.strip():
         known = next((x for x in CATEGORIES if x.lower() == given.strip().lower()), None)
         return known or given.strip()
-    text = (note or "").lower()
+    text_ = (note or "").lower()
     for category, keywords in CATEGORIES.items():
-        if any(k in text for k in keywords): return category
+        if any(k in text_ for k in keywords): return category
     return "Other income" if kind == "income" else "Other"
 
 def token_for(user: User) -> str:
@@ -160,13 +187,10 @@ def make_summary(db: Session, uid: int):
         if t.kind=="expense" and t.trans_date>=month_start: cats[t.category]+=float(t.amount)
     months=[]
     for i in range(5,-1,-1):
-        d=(today.replace(day=1)-timedelta(days=1)).replace(day=1) if i==0 else today.replace(day=1)
-        # Calculate each requested prior month without month-length overflow.
         m=today.month-i; y=today.year
         while m<=0: m+=12; y-=1
         label=date(y,m,1).strftime("%b %Y"); val=monthly.get(label,{"income":0.0,"expenses":0.0})
         months.append({"month":date(y,m,1).strftime("%b"),"income":round(val["income"],2),"expenses":round(val["expenses"],2)})
-    # A light-weight baseline forecast from the last three complete/current monthly periods.
     expense_months=[x["expenses"] for x in months if x["expenses"]>0]
     forecast=round(statistics.mean(expense_months[-3:]),2) if expense_months else round(expenses,2)
     return {"balance":round(income-expenses,2),"income":round(income,2),"expenses":round(expenses,2),"previous_expenses":round(prev,2),"expense_change_pct":round((expenses-prev)/prev*100,1) if prev else (0.0 if expenses == 0 else None),"transaction_count":len(txs),"categories":[{"category":k,"amount":round(v,2)} for k,v in sorted(cats.items(),key=lambda p:p[1],reverse=True)],"monthly":months,"forecast":forecast,"flagged_count":sum(1 for t in txs if t.flagged)}
@@ -177,7 +201,6 @@ def root(): return {"name":APP_NAME,"version":"1.0.0","status":"ok","docs":"/doc
 def health(): return {"status":"ok","service":"FinSight API"}
 @app.post("/api/demo/seed")
 def seed_demo(user: User = Depends(current_user), db: Session = Depends(get_db)):
-    """Seed a small sample for the currently signed-in user, only when explicitly enabled."""
     if os.getenv("ENABLE_DEMO_SEED", "false").lower() != "true":
         raise HTTPException(404, "Demo seeding is disabled.")
     if db.scalar(select(Transaction.id).where(Transaction.user_id == user.id).limit(1)):
@@ -322,39 +345,147 @@ def delete_goal(goal_id:int,user:User=Depends(current_user),db:Session=Depends(g
 def analytics(user:User=Depends(current_user),db:Session=Depends(get_db)):return make_summary(db,user.id)
 @app.get("/api/alerts")
 def alerts(user:User=Depends(current_user),db:Session=Depends(get_db)):
-    s=make_summary(db,user.id); out=[]
+    out=[]
     for t in get_user_transactions(db,user.id):
         if t.flagged:out.append({"id":f"tx-{t.id}","type":"anomaly","title":"Unusual transaction detected","message":f"{t.category} expense of ₹{float(t.amount):,.2f} was flagged by your spending baseline.","date":t.trans_date.isoformat()})
     for b in db.scalars(select(Budget).where(Budget.user_id==user.id)):
         spent=budget_spend(db,user.id,b);pct=spent/float(b.limit_amount)*100 if b.limit_amount else 0
         if pct>=90:out.append({"id":f"budget-{b.id}","type":"budget","title":f"{b.category} budget almost reached","message":f"You've used {pct:.0f}% of this {b.period} budget.","date":date.today().isoformat()})
     return out
-@app.get("/api/advisor")
-def advisor_summary(user_id:int|None=None, client_email:EmailStr|None=None, user:User=Depends(current_user),db:Session=Depends(get_db)):
-    if user_id is None and client_email is None:
-        raise HTTPException(400,"Provide either user_id or client_email for the linked client.")
-    target = db.get(User, user_id) if user_id is not None else db.scalar(select(User).where(func.lower(User.email)==str(client_email).lower()))
-    if not target:raise HTTPException(404,"Client not found.")
-    linked=db.scalar(select(AdvisorLink).where(AdvisorLink.user_id==target.id,func.lower(AdvisorLink.advisor_email)==user.email.lower()))
-    if not linked:raise HTTPException(403,"You do not have read-only advisor access to this account.")
-    s=make_summary(db,target.id)
-    return {"client":{"name":target.name,"email":target.email},"summary":s,"recent_transactions":[tx_json(t) for t in get_user_transactions(db,target.id)[:10]],"read_only":True}
-@app.get("/api/advisor/clients")
-def advisor_clients(user:User=Depends(current_user),db:Session=Depends(get_db)):
-    links=list(db.scalars(select(AdvisorLink).where(func.lower(AdvisorLink.advisor_email)==user.email.lower())))
-    return [{"id":u.id,"name":u.name,"email":u.email} for l in links if (u:=db.get(User,l.user_id))]
+
+def _link_dict(l: AdvisorLink):
+    return {
+        "id": l.id,
+        "advisor_email": l.advisor_email,
+        "status": l.status,
+        "created_at": l.created_at.isoformat(),
+        "accepted_at": l.accepted_at.isoformat() if l.accepted_at else None,
+    }
+
 @app.get("/api/advisor/links")
-def advisor_links(user:User=Depends(current_user),db:Session=Depends(get_db)):
-    return [{"id":l.id,"advisor_email":l.advisor_email,"created_at":l.created_at.isoformat()} for l in db.scalars(select(AdvisorLink).where(AdvisorLink.user_id==user.id))]
-@app.post("/api/advisor/links",status_code=201)
-def link_advisor(data:AdvisorIn,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    email=data.email.lower().strip()
-    if email==user.email.lower():raise HTTPException(400,"You cannot link your own account as an advisor.")
-    existing=db.scalar(select(AdvisorLink).where(AdvisorLink.user_id==user.id,func.lower(AdvisorLink.advisor_email)==email))
-    if existing:raise HTTPException(409,"This advisor is already linked.")
-    l=AdvisorLink(user_id=user.id,advisor_email=email);db.add(l);db.commit();db.refresh(l);return {"id":l.id,"advisor_email":l.advisor_email}
+def advisor_links(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(AdvisorLink).where(
+        AdvisorLink.user_id == user.id,
+        AdvisorLink.status != "revoked",
+    ).order_by(AdvisorLink.created_at.desc()))
+    return [_link_dict(l) for l in rows]
+
+@app.post("/api/advisor/links", status_code=201)
+def link_advisor(data: AdvisorIn, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    email = data.email.lower().strip()
+    if email == user.email.lower():
+        raise HTTPException(400, "You cannot link your own account as an advisor.")
+    existing = db.scalar(select(AdvisorLink).where(
+        AdvisorLink.user_id == user.id,
+        func.lower(AdvisorLink.advisor_email) == email,
+        AdvisorLink.status != "revoked",
+    ))
+    if existing:
+        raise HTTPException(409, "This advisor is already invited or linked.")
+    declined = db.scalar(select(AdvisorLink).where(
+        AdvisorLink.user_id == user.id,
+        func.lower(AdvisorLink.advisor_email) == email,
+        AdvisorLink.status == "declined",
+    ))
+    if declined:
+        declined.status = "pending"
+        declined.accepted_at = None
+        declined.revoked_at = None
+        declined.advisor_user_id = None
+        db.commit(); db.refresh(declined)
+        return _link_dict(declined)
+    link = AdvisorLink(user_id=user.id, advisor_email=email, status="pending")
+    db.add(link); db.commit(); db.refresh(link)
+    return _link_dict(link)
+
 @app.delete("/api/advisor/links/{link_id}")
-def unlink_advisor(link_id:int,user:User=Depends(current_user),db:Session=Depends(get_db)):
-    l=db.scalar(select(AdvisorLink).where(AdvisorLink.id==link_id,AdvisorLink.user_id==user.id))
-    if not l:raise HTTPException(404,"Advisor link not found.")
-    db.delete(l);db.commit();return {"ok":True}
+def unlink_advisor(link_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    link = db.scalar(select(AdvisorLink).where(AdvisorLink.id == link_id, AdvisorLink.user_id == user.id))
+    if not link: raise HTTPException(404, "Advisor link not found.")
+    link.status = "revoked"
+    link.revoked_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True}
+
+@app.get("/api/advisor/invitations")
+def advisor_invitations(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(AdvisorLink).where(
+        func.lower(AdvisorLink.advisor_email) == user.email.lower(),
+        AdvisorLink.status == "pending",
+    ).order_by(AdvisorLink.created_at.desc()))
+    out = []
+    for link in rows:
+        owner = db.get(User, link.user_id)
+        if not owner: continue
+        out.append({
+            "id": link.id,
+            "client_name": owner.name,
+            "client_email": owner.email,
+            "created_at": link.created_at.isoformat(),
+        })
+    return out
+
+@app.post("/api/advisor/invitations/{link_id}/accept")
+def accept_invitation(link_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    link = db.get(AdvisorLink, link_id)
+    if not link: raise HTTPException(404, "Invitation not found.")
+    if link.advisor_email.lower() != user.email.lower():
+        raise HTTPException(403, "This invitation is for a different email address.")
+    if link.status == "active":
+        return {"ok": True, "link_id": link.id, "status": "active"}
+    if link.status in ("revoked", "declined"):
+        raise HTTPException(400, "This invitation is no longer available.")
+    link.advisor_user_id = user.id
+    link.status = "active"
+    link.accepted_at = datetime.utcnow()
+    db.commit()
+    return {"ok": True, "link_id": link.id, "status": "active"}
+
+@app.post("/api/advisor/invitations/{link_id}/decline")
+def decline_invitation(link_id: int, user: User = Depends(current_user), db: Session = Depends(get_db)):
+    link = db.get(AdvisorLink, link_id)
+    if not link: raise HTTPException(404, "Invitation not found.")
+    if link.advisor_email.lower() != user.email.lower():
+        raise HTTPException(403, "This invitation is for a different email address.")
+    if link.status != "pending":
+        raise HTTPException(400, "This invitation is not pending.")
+    link.status = "declined"
+    db.commit()
+    return {"ok": True}
+
+@app.get("/api/advisor/clients")
+def advisor_clients(user: User = Depends(current_user), db: Session = Depends(get_db)):
+    rows = db.scalars(select(AdvisorLink).where(
+        AdvisorLink.advisor_user_id == user.id,
+        AdvisorLink.status == "active",
+    ))
+    out, seen = [], set()
+    for link in rows:
+        if link.user_id in seen: continue
+        seen.add(link.user_id)
+        owner = db.get(User, link.user_id)
+        if owner:
+            out.append({"id": owner.id, "name": owner.name, "email": owner.email})
+    return out
+
+@app.get("/api/advisor")
+def advisor_summary(user_id: int | None = None, client_email: EmailStr | None = None,
+                    user: User = Depends(current_user), db: Session = Depends(get_db)):
+    if user_id is None and client_email is None:
+        raise HTTPException(400, "Provide either user_id or client_email for the linked client.")
+    target = db.get(User, user_id) if user_id is not None else db.scalar(select(User).where(func.lower(User.email) == str(client_email).lower()))
+    if not target: raise HTTPException(404, "Client not found.")
+    linked = db.scalar(select(AdvisorLink).where(
+        AdvisorLink.user_id == target.id,
+        AdvisorLink.advisor_user_id == user.id,
+        AdvisorLink.status == "active",
+    ))
+    if not linked:
+        raise HTTPException(403, "You do not have read-only advisor access to this account.")
+    s = make_summary(db, target.id)
+    return {
+        "client": {"name": target.name, "email": target.email},
+        "summary": s,
+        "recent_transactions": [tx_json(t) for t in get_user_transactions(db, target.id)[:10]],
+        "read_only": True,
+    }

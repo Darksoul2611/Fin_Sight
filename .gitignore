@@ -6,3 +6,7 @@ __pycache__/
 node_modules/
 dist/
 .DS_Store
+
+*.bak
+apply_update.py
+add_advisor_portal.py
